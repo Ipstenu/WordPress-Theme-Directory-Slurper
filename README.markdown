@@ -27,6 +27,7 @@ The `themes/` directory will contain all the themes when the script is done.
 Copyright & License
 -------------------
 Copyright (C) 2011 Mark Jaquith
+Copyright (C) 2020 Mika Epstein
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
