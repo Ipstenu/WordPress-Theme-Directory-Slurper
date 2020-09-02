@@ -1,4 +1,4 @@
-#!/usr/bin/php
+#!/usr/bin/env php
 <?php
 $args = $argv;
 $cmd = array_shift( $args );
@@ -6,97 +6,254 @@ $cmd = array_shift( $args );
 chdir( dirname( __FILE__ ) );
 
 $type = 'all';
-if ( !empty( $args[0] ) ) {
+if ( ! empty( $args[0] ) ) {
 	$type = $args[0];
 }
 
-switch ( $type ) {
-	case 'readme':
-		$directory = 'readmes';
-		$download = 'readmes/%s.readme';
-		$url = 'https://themes.svn.wordpress.org/%s/trunk/readme.txt';
-		break;
-	case 'all':
-		$directory = 'themes';
-		$download = 'zips/%s.zip';
-		$url = 'https://downloads.wordpress.org/theme/%s.latest-stable.zip?nostats=1';
-		break;
-	default:
-		echo $cmd . ": invalid command\r\n";
-		echo 'Usage: php ' . $cmd . " [command]\r\n\r\n";
-		echo "Available commands:\r\n";
-		echo "  all - Downloads full theme zips\r\n";
-		echo "  readme - Downloads theme readmes only\r\n";
-		die();
+$parallel = 12;
+if ( ! empty( $args[1] ) ) {
+	$parallel = (int) $args[1];
 }
 
-echo "Determining most recent SVN revision...\r\n";
+if (
+	( $type !== 'readme' && $type !== 'all' ) ||
+	$parallel < 1 || $parallel > 20
+) {
+	echo $cmd . ": invalid arguments\n";
+	echo 'Usage: php ' . $cmd . " [command] [parallel=12]\n\n";
+	echo "Available commands:\n";
+	echo "  all    - Downloads full theme zips. This is the default.\n";
+	echo "  readme - Downloads theme readmes only.\n";
+	echo "\n";
+	echo "Set 'parallel' to control the number of parallel processes.\n";
+	echo "  A smaller number may go more smoothly for slower connections.\n";
+	echo "  More than 12 is not recommended.\n";
+	die();
+}
+
+require_once 'common.php';
+
+echo "Determining most recent SVN revision...\n";
+
 try {
+	ini_set( 'user_agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:80.0) Gecko/20100101 Firefox/80.0' );
 	$changelog = @file_get_contents( 'https://themes.trac.wordpress.org/log/?format=changelog&stop_rev=HEAD' );
-	if ( !$changelog )
+	if ( ! $changelog ) {
 		throw new Exception( 'Could not fetch the SVN changelog' );
+	}
 	preg_match( '#\[([0-9]+)\]#', $changelog, $matches );
-	if ( !$matches[1] )
+	if ( ! $matches[1] ) {
 		throw new Exception( 'Could not determine most recent revision.' );
+	}
 } catch ( Exception $e ) {
-	die( $e->getMessage() . "\r\n" );
+	die( $e->getMessage() . "\n" );
 }
+
 $svn_last_revision = (int) $matches[1];
-echo "Most recent SVN revision: " . $svn_last_revision . "\r\n";
-if ( file_exists( $directory . '/.last-revision' ) ) {
-	$last_revision = (int) file_get_contents( $directory . '/.last-revision' );
-	echo "Last synced revision: " . $last_revision . "\r\n";
-} else {
-	$last_revision = false;
-	echo "You have not yet performed a successful sync. Settle in. This will take a while.\r\n";
-}
+
+echo "Most recent SVN revision : $svn_last_revision\n";
+$last_revision = read_last_revision( $type );
 
 $start_time = time();
-$themes = array();
 
-if ( $last_revision != $svn_last_revision ) {
-	if ( $last_revision ) {
-		$changelog_url = sprintf( 'https://themes.trac.wordpress.org/log/?verbose=on&mode=follow_copy&format=changelog&rev=%d&limit=%d', $svn_last_revision, $svn_last_revision - $last_revision );
-		$changes = file_get_contents( $changelog_url );
-		preg_match_all( '#^' . "\t" . '*\* ([^/A-Z ]+)[ /].* \((added|modified|deleted|moved|copied)\)' . "\n" . '#m', $changes, $matches );
-		$themes = array_unique( $matches[1] );
-	} else {
-		$themes = file_get_contents( 'https://themes.svn.wordpress.org/' );
-		preg_match_all( '#<li><a href="([^/]+)/">([^/]+)/</a></li>#', $themes, $matches );
-		$themes = $matches[1];
+if ( $last_revision === $svn_last_revision ) {
+	// Nothing to do.
+
+	echo "Your copy of the theme repository is up to date.\n";
+	exit( 0 );
+
+} else if ( $last_revision ) {
+	// Do a partial sync to update the repository.
+
+	echo "Last synced revision     : $last_revision\n";
+
+	if ( $svn_last_revision - $last_revision > 200000 ) {
+		echo "Your copy of the theme repository is VERY far behind.\n";
+		echo "We'll try to sync, but you may want to delete it and start over.\n";
 	}
 
-	foreach ( $themes as $theme ) {
-		$theme = urldecode( $theme );
-		echo "Updating " . $theme;
+	// For each theme, store an array of revision indices where it was
+	// updated.  These indices point to entries in the $revisions array.
+	// Structure:
+	// {
+	//     'theme-slug': [
+	//         IndexIn$revisions,
+	//         ...
+	//     ],
+	//     ...
+	// }
+	$themes = array();
 
-		$output = null; $return = null;
-		exec( 'wget -q -np -O ' . escapeshellarg( sprintf($download, $theme) ) . ' ' . escapeshellarg( sprintf($url, $theme) ) . ' > /dev/null', $output, $return );
+	// Store an array of revisions too.  When a theme is updated, ALL of its
+	// associated revisions will be marked as updated in this list.  During a
+	// partial sync, this allows us to accurately determine the latest revision
+	// saved on the hard drive.
+	// Structure (note - revisions are in descending order for efficiency):
+	// [
+	//     {
+	//         'number': RevisionNumber,
+	//         'to_update': {
+	//             'theme-slug': true,
+	//             ...
+	//         }
+	//     },
+	//     ...
+	// ]
+	$revisions = array();
 
-		if ( $return === 0 && file_exists( sprintf($download, $theme) ) ) {
-			if ($type === 'all') {
-				if ( file_exists( 'themes/' . $theme ) )
-					exec( 'rm -rf ' . escapeshellarg( 'themes/' . $theme ) );
+	// Fetch the themes repository changelog using `svn log`.
+	$changelog_command = sprintf(
+		'svn log -v -q https://themes.svn.wordpress.org/ -r %d:%d',
+		$svn_last_revision,
+		$last_revision + 1
+	);
+	echo "Requesting themes changelog:\n";
+	echo "$changelog_command\n";
 
-				exec( 'unzip -o -d themes ' . escapeshellarg( 'zips/' . $theme . '.zip' ) );
-				exec( 'rm -rf ' . escapeshellarg( 'zips/' . $theme . '.zip' ) );
+	// Start `svn` process.
+	$descriptors = array(
+		1 => array( 'pipe', 'w' ), // `svn` will write to stdout.
+	);
+	$svn = proc_open( $changelog_command, $descriptors, $pipes );
+
+	// Process output from `svn log`.
+	$revision = 0;
+	while ( ( $line = fgets( $pipes[1] ) ) !== false ) {
+		if ( preg_match( '#^r([0-9]+) \\|#', $line, $matches ) ) {
+			// This line indicates the revision number for the following
+			// change(s).
+			if ( ! $revision ) { // This is the first log entry.
+				echo "... r$svn_last_revision ";
 			}
-		} else {
-			echo '... download failed.';
+			$revision = (int) $matches[1];
+			if ( ( $revision % 5000 ) === 0 ) {
+				echo "\n... r$revision ";
+			} else if ( ( $revision % 100 ) === 0 ) {
+				echo ".";
+			}
+
+		} else if ( preg_match( '#^   [ADMR] /([^/(]+)/#', $line, $matches ) ) {
+			// This line indicates an operation performed on a theme file.
+			// For copies we get lines like "   A /theme-slug (from /...:###)"
+			// (r1725406 for example) so trim to remove any extra spaces.
+			$theme = trim( $matches[1] );
+
+			if ( ! isset( $themes[ $theme ] ) ) {
+				// This is the first time we've seen this theme.
+				$themes[ $theme ] = array();
+			}
+
+			if (
+				count( $revisions ) === 0 ||
+				$revisions[ count( $revisions ) - 1 ]['number'] !== $revision
+			) {
+				// Add a new entry for this revision.
+				array_push( $revisions, array(
+					'number'    => $revision,
+					'to_update' => array(),
+				) );
+			}
+
+			$rev_index = count( $revisions ) - 1;
+
+			// Mark this theme as updated by the current revision.  (It's
+			// possible for a theme author to update multiple themes in a
+			// single revision.)
+			if ( ! isset( $revisions[ $rev_index ]['to_update'][ $theme ] ) ) {
+				$revisions[ $rev_index ]['to_update'][ $theme ] = true;
+				array_push( $themes[ $theme ], $rev_index );
+			}
 		}
-		echo "\r\n";
+	}
+	echo "\n";
+
+	$status = proc_get_status( $svn );
+	if ( $status['running'] ) {
+		throw new Exception(
+			'svn should not still be running.'
+		);
+	}
+	if ( $status['exitcode'] ) {
+		throw new Exception( sprintf(
+			'Unexpected svn exit code:  %d.  Make sure svn is installed.',
+			$status['exitcode']
+		) );
 	}
 
-	if ( file_put_contents( $directory . '/.last-revision', $svn_last_revision ) )
-		echo "[CLEANUP] Updated $directory/.last-revision to " . $svn_last_revision . "\r\n";
-	else
-		echo "[ERROR] Could not update $directory/.last-revision to " . $svn_last_revision . "\r\n";
+	proc_close( $svn );
+
+	// Make sure we got all the expected changelog entries.
+	if ( $revision !== $last_revision + 1 ) {
+		throw new Exception( sprintf(
+			'Failed to parse themes changelog (expected revision %d but found %d).',
+			$last_revision + 1,
+			$revision
+		) );
+	}
+
+	// We have data structures with info about all the themes and revisions we
+	// need to fetch.  Now, loop over all the revisions in reverse order
+	// (oldest to newest) and fetch themes in this order.
+	$themes_ordered = array();
+	for ( $i = count( $revisions ) - 1; $i >= 0; $i-- ) {
+		foreach ( $revisions[ $i ]['to_update'] as $theme => $ignore ) {
+			$themes_ordered[ $theme ] = true;
+		}
+	}
+	$themes_ordered = array_keys( $themes_ordered );
+
+	printf(
+		"%d theme%s to update (%d SVN revision%s)\n",
+		count( $themes ),
+		( count( $themes ) === 1 ? '' : 's' ),
+		count( $revisions ),
+		( count( $revisions ) === 1 ? '' : 's' )
+	);
+
+	$update_stats = download_themes( $type, $themes_ordered, true );
+	// This should happen during the update but it won't hurt to do it again.
+	write_last_revision( $type, $svn_last_revision );
+
+} else {
+	// Do an initial full sync.
+
+	echo "\n";
+	echo "You have not performed a successful sync yet.\n";
+	echo "Settle in.  This will take a while.\n";
+	echo "\n";
+
+	echo "Fetching list of all themes...\n";
+	$themes = file_get_contents( 'https://themes.svn.wordpress.org/' );
+	if ( ! $themes ) {
+		// Something went wrong; there should be a warning message above
+		throw new Exception( 'Failed to download themes list.' );
+	}
+	preg_match_all( '#<li><a href="([^/]+)/">([^/]+)/</a></li>#', $themes, $matches );
+	$themes = $matches[1];
+
+	printf(
+		"%d themes to download\n",
+		count( $themes )
+	);
+
+	$update_stats = download_themes( $type, $themes, false );
+	write_last_revision( $type, $svn_last_revision );
+
 }
 
 $end_time = time();
-$minutes = ( $end_time - $start_time ) / 60;
+$minutes = floor( ( $end_time - $start_time ) / 60 );
 $seconds = ( $end_time - $start_time ) % 60;
 
-echo "[SUCCESS] Done updating themes!\r\n";
-echo "It took " . number_format($minutes) . " minute" . ( $minutes == 1 ? '' : 's' ) . " and " . $seconds . " second" . ( $seconds == 1 ? '' : 's' ) . " to update ". count($themes)  ." theme" . ( count($themes) == 1 ? '' : 's') . "\r\n";
-echo "[DONE]\r\n";
+echo "[SUCCESS] Done updating themes!\n";
+printf(
+	"It took %d minute%s and %d second%s to update %d theme%s (%d failed).\n",
+	$minutes,
+	( $minutes === 1 ? '' : 's' ),
+	$seconds,
+	( $seconds === 1 ? '' : 's' ),
+	$update_stats['updated'],
+	( $update_stats['updated'] === 1 ? '' : 's' ),
+	$update_stats['failed']
+);
+echo "[DONE]\n";

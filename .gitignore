@@ -1,0 +1,9 @@
+themes/
+!themes/README.md
+readmes/
+!readmes/README.md
+scans/
+!scans/README.md
+zips/
+!zips/README.md
+update.txt
